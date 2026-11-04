@@ -1,0 +1,25 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: naija, POSTGRES_PASSWORD: naija, POSTGRES_DB: votes }
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U naija -d votes"], interval: 5s, retries: 10 }
+  redis:
+    image: redis:7-alpine
+    healthcheck: { test: ["CMD", "redis-cli", "ping"], interval: 5s, retries: 10 }
+  api:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgres://naija:naija@db:5432/votes
+      REDIS_URL: redis://redis:6379
+    depends_on: { db: { condition: service_healthy }, redis: { condition: service_healthy } }
+    deploy: { replicas: 2 }          # scale: docker compose up --scale api=3
+  simulator:
+    build: ./simulator
+    environment: { API_URL: http://api:4000, VOTES_PER_SEC: "15" }
+    depends_on: [api]
+  web:
+    build: ./frontend
+    ports: ["8080:80"]               # open http://localhost:8080
+    depends_on: [api]
+volumes: { pgdata: {} }
