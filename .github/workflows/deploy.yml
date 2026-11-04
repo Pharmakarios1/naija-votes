@@ -25,8 +25,11 @@ jobs:
     runs-on: ubuntu-latest   # x86, which matches the Fargate tasks
     steps:
       - uses: actions/checkout@v4
-
+      - name: Check variables are set
+        run: |
+          test -n "${{ vars.AWS_DEPLOY_ROLE_ARN }}" || { echo "AWS_DEPLOY_ROLE_ARN is empty"; exit 1; }
       - uses: aws-actions/configure-aws-credentials@v4
+      
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
