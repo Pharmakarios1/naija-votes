@@ -1,0 +1,21 @@
+# Terraform working directory
+.terraform/
+
+# State files
+*.tfstate
+*.tfstate.*
+*.tfplan
+
+# Variable files containing secrets
+*.tfvars
+*.tfvars.json
+
+# Git files
+.git/
+
+# Documentation
+README.md
+
+# Local configuration
+.terraformrc
+terraform.rc
