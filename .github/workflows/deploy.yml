@@ -1,0 +1,69 @@
+name: Deploy
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # lets the job request a GitHub OIDC token
+  contents: read
+
+concurrency:
+  group: deploy        # never run two deploys at once
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-west-1   # keep in sync with terraform var.region
+  PROJECT: naija-vote     # keep in sync with terraform var.name
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml   # build + smoke test must pass first
+
+  deploy:
+    needs: ci
+    runs-on: ubuntu-latest   # x86, which matches the Fargate tasks
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push images (skipped if this commit was already built)
+        env:
+          REG: ${{ steps.ecr.outputs.registry }}
+        run: |
+          build() {  # usage: build <app> <dir> [extra docker args]
+            if aws ecr describe-images --repository-name "$PROJECT/$1" --image-ids imageTag="$GITHUB_SHA" > /dev/null 2>&1; then
+              echo "$1 @ $GITHUB_SHA already exists, reusing"; return
+            fi
+            docker build -t "$REG/$PROJECT/$1:$GITHUB_SHA" "${@:3}" "$2"
+            docker push "$REG/$PROJECT/$1:$GITHUB_SHA"
+          }
+          build api backend
+          build web frontend --build-arg NGINX_CONF=nginx.ecs.conf
+          build simulator simulator
+
+      - name: Roll out (new task-definition revision per service, pinned to this commit)
+        env:
+          REG: ${{ steps.ecr.outputs.registry }}
+        run: |
+          for svc in api web simulator; do
+            TD=$(aws ecs describe-task-definition --task-definition "$PROJECT-$svc" --query taskDefinition)
+            NEW=$(jq --arg img "$REG/$PROJECT/$svc:$GITHUB_SHA" \
+              'del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy) | .containerDefinitions[0].image=$img' <<< "$TD")
+            ARN=$(aws ecs register-task-definition --cli-input-json "$NEW" --query taskDefinition.taskDefinitionArn --output text)
+            aws ecs update-service --cluster "$PROJECT" --service "$svc" --task-definition "$ARN" > /dev/null
+            echo "$svc -> $ARN"
+          done
+          aws ecs wait services-stable --cluster "$PROJECT" --services api web simulator
+
+      - name: Smoke test
+        run: |
+          curl -sf "${{ vars.APP_URL }}/health"
+          curl -sf "${{ vars.APP_URL }}/api/results" | grep -q '"total"'
