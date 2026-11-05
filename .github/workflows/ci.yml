@@ -6,9 +6,24 @@ jobs:
   build-and-smoke-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - run: docker compose build
-      - run: docker compose up -d && sleep 25
+      - name:  Checkout code
+        uses:  actions/checkout@v4
+      - name:  Set short SHA
+        run:  |
+          echo "SHORT_SHA=$(echo  ${GITHUB_SHA} | cut -c1-7)" >> $GITHUB_ENV
+      - name:  Build Docker IMage
+        run: docker build -t pharmakarios1/naija-votes:${{ env.SHORT_SHA}} .
+      - name: login to docker hub
+        run:  |
+          echo "${{secrets.DOCKERHUB_TOKEN}}" | docker login -u "${{ secrets.DOCKER_USERNAME}}" --password-stdin
+      - name:  push to dockerhub
+        run:  |
+          docker push pharmakarios1/naija-votes:${{ env.SHORT_SHA}}
+        
+      - name:  Running compose
+        run:  |
+           docker compose up -d && sleep 25
+
       - name: Smoke test
         run: |
           curl -sf http://localhost:8080/api/results | grep -q '"total"'
