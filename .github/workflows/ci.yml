@@ -1,40 +1,46 @@
+
 name: CI
 on:
   pull_request:
   workflow_call: # deploy.yml calls this, so nothing ships unless CI passes
+
 jobs:
   build-and-smoke-test:
     runs-on: ubuntu-latest
     strategy:
       matrix:
         service: [frontend, backend, simulator]
+
     steps:
-      - name:  Checkout code
-        uses:  actions/checkout@v4
-      - name:  Set short SHA
-        run:  |
-          echo "SHORT_SHA=$(echo  ${GITHUB_SHA} | cut -c1-7)" >> $GITHUB_ENV
-      - name:  Build Docker Image
-        run:  |
-         run: |
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set short SHA
+        run: |
+          echo "SHORT_SHA=$(echo ${GITHUB_SHA} | cut -c1-7)" >> $GITHUB_ENV
+
+      - name: Build Docker Image
+        run: |
           docker build \
             -t pharmakarios1/naija-votes-${{ matrix.service }}:${{ env.SHORT_SHA }} \
-            -f ${{ matrix.service }}/Dockerfile .
-          
-      - name: login to docker hub
-        run:  |
-          echo "${{secrets.DOCKERHUB_TOKEN}}" | docker login -u "${{ secrets.DOCKER_USERNAME}}" --password-stdin
-      - name:  push to dockerhub
-        run:  |
-          docker push pharmakarios1/naija-votes:${{ env.SHORT_SHA}}
-        
-      - name:  Running compose
-        run:  |
-           docker compose up -d && sleep 25
+            -f ${{ matrix.service }}/Dockerfile ./${{ matrix.service }}
+
+      - name: Login to Docker Hub
+        run: |
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+
+      - name: Push to Docker Hub
+        run: |
+          docker push pharmakarios1/naija-votes-${{ matrix.service }}:${{ env.SHORT_SHA }}
+
+      - name: Running compose
+        run: |
+          docker compose up -d && sleep 25
 
       - name: Smoke test
         run: |
           curl -sf http://localhost:8080/api/results | grep -q '"total"'
           curl -sf -X POST -H 'Content-Type: application/json' -d '{"state":"Lagos","party":"LP"}' http://localhost:8080/api/vote
+
       - if: always()
         run: docker compose logs && docker compose down -v
