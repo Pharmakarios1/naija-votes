@@ -5,14 +5,22 @@ on:
 jobs:
   build-and-smoke-test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [frontend, backend, simulator]
     steps:
       - name:  Checkout code
         uses:  actions/checkout@v4
       - name:  Set short SHA
         run:  |
           echo "SHORT_SHA=$(echo  ${GITHUB_SHA} | cut -c1-7)" >> $GITHUB_ENV
-      - name:  Build Docker IMage
-        run: docker build -t pharmakarios1/naija-votes:${{ env.SHORT_SHA}} .
+      - name:  Build Docker Image
+        run:  |
+         run: |
+          docker build \
+            -t pharmakarios1/naija-votes-${{ matrix.service }}:${{ env.SHORT_SHA }} \
+            -f ${{ matrix.service }}/Dockerfile .
+          
       - name: login to docker hub
         run:  |
           echo "${{secrets.DOCKERHUB_TOKEN}}" | docker login -u "${{ secrets.DOCKER_USERNAME}}" --password-stdin
