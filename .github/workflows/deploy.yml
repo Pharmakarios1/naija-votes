@@ -23,24 +23,55 @@ jobs:
   deploy:
     needs: ci
     runs-on: ubuntu-latest   # x86, which matches the Fargate tasks
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Check variables are set
-        run: |
-          test -n "${{ vars.AWS_DEPLOY_ROLE_ARN }}" || { echo "AWS_DEPLOY_ROLE_ARN is empty"; exit 1; }
 
-      
-      - uses: aws-actions/configure-aws-credentials@v4
+      # 1. Fail fast, with a readable message, if a repository variable is missing
+      - name: Preflight - variables
+        env:
+          ROLE: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          URL: ${{ vars.APP_URL }}
+        run: |
+          [ -n "$ROLE" ] || { echo "::error::Repository variable AWS_DEPLOY_ROLE_ARN is empty (Settings > Secrets and variables > Actions > Variables)"; exit 1; }
+          [ -n "$URL" ]  || { echo "::error::Repository variable APP_URL is empty"; exit 1; }
+
+      # 2. Read-only diagnosis: what identity does GitHub present to AWS? (the token itself is never printed)
+      - name: Preflight - OIDC identity report
+        continue-on-error: true
+        run: |
+          TOKEN=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
+          CLAIMS=$(python3 - "$TOKEN" <<'PY'
+          import sys, base64
+          p = sys.argv[1].split('.')[1]
+          p += '=' * (-len(p) % 4)
+          print(base64.urlsafe_b64decode(p).decode())
+          PY
+          )
+          SUB=$(jq -r .sub <<< "$CLAIMS"); AUD=$(jq -r .aud <<< "$CLAIMS")
+          echo "sub = $SUB"; echo "aud = $AUD"
+          {
+            echo "### OIDC identity report"
+            echo "- Token subject (sub): \`$SUB\`"
+            echo "- Audience (aud): \`$AUD\`"
+            echo "- Exact repo spelling: \`$GITHUB_REPOSITORY\`"
+            echo ""
+            echo "AWS trusts this role only if its trust policy contains exactly \`$SUB\`. If login fails, run:"
+            echo '```'
+            echo "terraform apply -var github_repo=$GITHUB_REPOSITORY -var alert_email=YOU@EXAMPLE.COM"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # 3. Exchange the GitHub token for temporary AWS credentials
+      - id: creds
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-        
-      - name: Debug OIDC subject (temporary, remove afterwards)
-        run: |
-          TOKEN=$(curl -sH "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
-          echo "$TOKEN" | cut -d. -f2 | tr '_-' '/+' | awk '{ while (length($0)%4) $0=$0"="; print }' \
-            | base64 -d | jq '{sub, aud, ref}'
+
+      - name: Who am I?
+        run: aws sts get-caller-identity
 
       - id: ecr
         uses: aws-actions/amazon-ecr-login@v2
@@ -65,16 +96,32 @@ jobs:
           REG: ${{ steps.ecr.outputs.registry }}
         run: |
           for svc in api web simulator; do
-            TD=$(aws ecs describe-task-definition --task-definition "$PROJECT-$svc" --query taskDefinition)
-            NEW=$(jq --arg img "$REG/$PROJECT/$svc:$GITHUB_SHA" \
-              'del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy) | .containerDefinitions[0].image=$img' <<< "$TD")
+            TD=$(aws ecs describe-task-definition --task-definition "$PROJECT-$svc" --query taskDefinition --output json)
+            # keep only fields register-task-definition accepts, then swap in this commit's image
+            NEW=$(jq --arg svc "$svc" --arg img "$REG/$PROJECT/$svc:$GITHUB_SHA" '
+              {family, taskRoleArn, executionRoleArn, networkMode, containerDefinitions, volumes,
+               placementConstraints, requiresCompatibilities, cpu, memory, runtimePlatform,
+               ephemeralStorage, pidMode, ipcMode}
+              | with_entries(select(.value != null))
+              | (.containerDefinitions[] | select(.name == $svc) | .image) = $img' <<< "$TD")
             ARN=$(aws ecs register-task-definition --cli-input-json "$NEW" --query taskDefinition.taskDefinitionArn --output text)
             aws ecs update-service --cluster "$PROJECT" --service "$svc" --task-definition "$ARN" > /dev/null
             echo "$svc -> $ARN"
           done
           aws ecs wait services-stable --cluster "$PROJECT" --services api web simulator
 
-      - name: Smoke test
+      - name: Smoke test (retries while the load balancer warms up)
+        env:
+          APP_URL: ${{ vars.APP_URL }}
         run: |
-          curl -sf "${{ vars.APP_URL }}/health"
-          curl -sf "${{ vars.APP_URL }}/api/results" | grep -q '"total"'
+          curl -sf --retry 10 --retry-delay 6 --retry-all-errors "$APP_URL/health"
+          curl -sf --retry 10 --retry-delay 6 --retry-all-errors "$APP_URL/api/results" | grep -q '"total"'
+
+      - name: Show recent ECS events (only on failure)
+        if: failure() && steps.creds.outcome == 'success'
+        run: |
+          for svc in api web simulator; do
+            echo "== $svc"
+            aws ecs describe-services --cluster "$PROJECT" --services "$svc" \
+              --query 'services[0].events[:5].message' --output text || true
+          done
